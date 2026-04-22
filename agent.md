@@ -1,5 +1,5 @@
 현재 단계:
-Phase 11. Push/PR
+완료
 
 완료한 것:
 - 작업 폴더 확인: /Users/gang-yeong-im/JUNGLE/Threaded_DB-API_Server
@@ -25,9 +25,12 @@ Phase 11. Push/PR
 - Makefile에 make/run/test/api-test/bench/clean 추가
 - README와 docs 문서 작성
 - GitHub Actions CI 작성
+- commit 생성: 855e71fa6b5733a1b912b4da07e3fcb2a83c5d80
+- origin seonho push 성공
+- docs/issue.md, docs/pr.md 생성
 
 남은 것:
-- commit, push, 가능하면 Issue/PR 생성
+- 없음
 
 의사결정:
 - 질문 없이 과제 목표에 맞게 구현한다.
@@ -43,12 +46,16 @@ Phase 11. Push/PR
 - 기존 `src/main.c`가 CLI main이라 서버 main을 같은 이름으로 둘 수 없다.
 - 기본 sandbox에서는 로컬 포트 bind가 막혀 API 테스트가 실패했다.
 - API 테스트가 `wait`만 호출해 서버 프로세스까지 기다리는 문제가 있었다.
+- gh CLI가 설치되어 있지 않았다.
+- GitHub 앱으로 Issue/PR 생성을 시도했지만 403 Resource not accessible by integration 오류가 났다.
 
 해결:
 - `src/server_main.c`를 추가하고 Makefile에서 sql_processor/server 빌드 구성을 분리한다.
 - 승인된 escalated 실행으로 로컬 bind 테스트를 수행했다.
 - API 테스트에서 curl PID만 모아 기다리도록 수정했다.
 - macOS에서 `_SC_NPROCESSORS_ONLN`이 feature macro 조합에 따라 숨을 수 있어, 상수가 없으면 기본 worker를 2로 둔다.
+- Issue/PR 본문은 docs/issue.md, docs/pr.md에 저장했다.
+- PR 생성 URL은 push 결과로 확인했다: https://github.com/whiskend/Threaded_DB-API_Server/pull/new/seonho
 
 테스트 결과:
 - 기존 make: 성공
