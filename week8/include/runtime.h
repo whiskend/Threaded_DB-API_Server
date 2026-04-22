@@ -3,10 +3,19 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <pthread.h>
 
 #include "ast.h"
 #include "bptree.h"
 #include "schema.h"
+
+#define TABLE_RUNTIME_RANGE_LOCK_COUNT 64U
+#define TABLE_RUNTIME_INSERT_RANGE_WINDOW 5U
+
+typedef struct {
+    size_t indices[TABLE_RUNTIME_RANGE_LOCK_COUNT];
+    size_t count;
+} RuntimeRangeLockSet;
 
 /* 실행 중 한 테이블의 schema, next_id, 인덱스 캐시를 보관하는 runtime 엔트리다. */
 typedef struct {
@@ -17,6 +26,11 @@ typedef struct {
     int id_index_ready;    /* B+Tree 인덱스 빌드가 완료됐는지 나타낸다. */
     uint64_t next_id;      /* 다음 INSERT에 부여할 auto-generated id다. */
     BPTree id_index;       /* id -> row_offset 매핑을 담는 B+Tree다. */
+    int locks_initialized;
+    pthread_mutex_t *next_id_lock;
+    pthread_rwlock_t *data_lock;
+    pthread_rwlock_t *index_lock;
+    pthread_mutex_t *range_locks;
 } TableRuntime;
 
 /* 한 실행 동안 재사용되는 DB 경로와 테이블 캐시 배열을 담는 컨텍스트다. */
@@ -49,6 +63,15 @@ int runtime_preload_table(ExecutionContext *ctx,
                           const char *table_name,
                           char *errbuf,
                           size_t errbuf_size);
+
+int table_runtime_lock_id_window(TableRuntime *table,
+                                 uint64_t id,
+                                 uint64_t window,
+                                 RuntimeRangeLockSet *lock_set,
+                                 char *errbuf,
+                                 size_t errbuf_size);
+void table_runtime_unlock_id_window(TableRuntime *table,
+                                    const RuntimeRangeLockSet *lock_set);
 
 /*
  * schema와 id_column_index를 기준으로 data 파일을 스캔해 out_tree를 채우고,

@@ -52,6 +52,164 @@ static char *dup_string(const char *text)
     return copy;
 }
 
+/* TableRuntime이 소유한 pthread lock들을 초기화한다. */
+static int init_table_runtime_locks(TableRuntime *table, char *errbuf, size_t errbuf_size)
+{
+    size_t initialized_range_count = 0U;
+    int next_id_initialized = 0;
+    int data_initialized = 0;
+    int index_initialized = 0;
+
+    if (table == NULL) {
+        set_error(errbuf, errbuf_size, "EXEC ERROR: invalid table lock initialization arguments");
+        return STATUS_EXEC_ERROR;
+    }
+
+    table->next_id_lock = (pthread_mutex_t *)calloc(1U, sizeof(*table->next_id_lock));
+    table->data_lock = (pthread_rwlock_t *)calloc(1U, sizeof(*table->data_lock));
+    table->index_lock = (pthread_rwlock_t *)calloc(1U, sizeof(*table->index_lock));
+    table->range_locks = (pthread_mutex_t *)calloc(TABLE_RUNTIME_RANGE_LOCK_COUNT,
+                                                   sizeof(*table->range_locks));
+    if (table->next_id_lock == NULL || table->data_lock == NULL ||
+        table->index_lock == NULL || table->range_locks == NULL) {
+        set_error(errbuf, errbuf_size, "EXEC ERROR: out of memory");
+        goto fail;
+    }
+
+    if (pthread_mutex_init(table->next_id_lock, NULL) != 0) {
+        set_error(errbuf, errbuf_size, "EXEC ERROR: failed to initialize next-id lock");
+        goto fail;
+    }
+    next_id_initialized = 1;
+
+    if (pthread_rwlock_init(table->data_lock, NULL) != 0) {
+        set_error(errbuf, errbuf_size, "EXEC ERROR: failed to initialize data lock");
+        goto fail;
+    }
+    data_initialized = 1;
+
+    if (pthread_rwlock_init(table->index_lock, NULL) != 0) {
+        set_error(errbuf, errbuf_size, "EXEC ERROR: failed to initialize index lock");
+        goto fail;
+    }
+    index_initialized = 1;
+
+    while (initialized_range_count < TABLE_RUNTIME_RANGE_LOCK_COUNT) {
+        if (pthread_mutex_init(&table->range_locks[initialized_range_count], NULL) != 0) {
+            set_error(errbuf, errbuf_size, "EXEC ERROR: failed to initialize range lock");
+            goto fail;
+        }
+        initialized_range_count += 1U;
+    }
+
+    table->locks_initialized = 1;
+    return STATUS_OK;
+
+fail:
+    while (initialized_range_count > 0U) {
+        initialized_range_count -= 1U;
+        pthread_mutex_destroy(&table->range_locks[initialized_range_count]);
+    }
+    if (index_initialized) {
+        pthread_rwlock_destroy(table->index_lock);
+    }
+    if (data_initialized) {
+        pthread_rwlock_destroy(table->data_lock);
+    }
+    if (next_id_initialized) {
+        pthread_mutex_destroy(table->next_id_lock);
+    }
+    free(table->range_locks);
+    free(table->index_lock);
+    free(table->data_lock);
+    free(table->next_id_lock);
+    table->range_locks = NULL;
+    table->index_lock = NULL;
+    table->data_lock = NULL;
+    table->next_id_lock = NULL;
+    table->locks_initialized = 0;
+    return STATUS_EXEC_ERROR;
+}
+
+/* TableRuntime이 소유한 pthread lock들을 해제한다. */
+static void destroy_table_runtime_locks(TableRuntime *table)
+{
+    size_t i;
+
+    if (table == NULL) {
+        return;
+    }
+
+    if (table->locks_initialized) {
+        if (table->range_locks != NULL) {
+            for (i = 0U; i < TABLE_RUNTIME_RANGE_LOCK_COUNT; ++i) {
+                pthread_mutex_destroy(&table->range_locks[i]);
+            }
+        }
+        if (table->index_lock != NULL) {
+            pthread_rwlock_destroy(table->index_lock);
+        }
+        if (table->data_lock != NULL) {
+            pthread_rwlock_destroy(table->data_lock);
+        }
+        if (table->next_id_lock != NULL) {
+            pthread_mutex_destroy(table->next_id_lock);
+        }
+    }
+
+    free(table->range_locks);
+    free(table->index_lock);
+    free(table->data_lock);
+    free(table->next_id_lock);
+    table->range_locks = NULL;
+    table->index_lock = NULL;
+    table->data_lock = NULL;
+    table->next_id_lock = NULL;
+    table->locks_initialized = 0;
+}
+
+/* TableRuntime 하나가 소유한 heap 메모리와 lock 자원을 모두 해제한다. */
+static void free_table_runtime_contents(TableRuntime *table)
+{
+    if (table == NULL) {
+        return;
+    }
+
+    destroy_table_runtime_locks(table);
+    free(table->table_name);
+    free_table_schema(&table->schema);
+    bptree_destroy(&table->id_index);
+    memset(table, 0, sizeof(*table));
+}
+
+/* RuntimeRangeLockSet에 stripe index를 중복 없이 오름차순으로 추가한다. */
+static int add_range_lock_index(RuntimeRangeLockSet *lock_set, size_t index)
+{
+    size_t position = 0U;
+    size_t i;
+
+    if (lock_set == NULL || index >= TABLE_RUNTIME_RANGE_LOCK_COUNT) {
+        return 0;
+    }
+
+    while (position < lock_set->count && lock_set->indices[position] < index) {
+        position += 1U;
+    }
+    if (position < lock_set->count && lock_set->indices[position] == index) {
+        return 1;
+    }
+    if (lock_set->count >= TABLE_RUNTIME_RANGE_LOCK_COUNT) {
+        return 0;
+    }
+
+    for (i = lock_set->count; i > position; --i) {
+        lock_set->indices[i] = lock_set->indices[i - 1U];
+    }
+    lock_set->indices[position] = index;
+    lock_set->count += 1U;
+    return 1;
+}
+
 /* text가 leading zero 없는 양의 uint64 정수인지 검사하고 out_value에 파싱 결과를 넣는다. */
 static int parse_canonical_positive_uint64(const char *text, uint64_t *out_value)
 {
@@ -322,6 +480,12 @@ int get_or_load_table_runtime(ExecutionContext *ctx,
     }
 
     ctx->tables[ctx->table_count] = table;
+    status = init_table_runtime_locks(&ctx->tables[ctx->table_count], errbuf, errbuf_size);
+    if (status != STATUS_OK) {
+        free_table_runtime_contents(&ctx->tables[ctx->table_count]);
+        return status;
+    }
+
     *out_table = &ctx->tables[ctx->table_count];
     ctx->table_count += 1U;
     return STATUS_OK;
@@ -338,6 +502,87 @@ int runtime_preload_table(ExecutionContext *ctx,
     return get_or_load_table_runtime(ctx, table_name, &table, errbuf, errbuf_size);
 }
 
+/* id 기준 앞뒤 window 범위에 대응하는 stripe lock들을 deadlock 없이 잡는다. */
+int table_runtime_lock_id_window(TableRuntime *table,
+                                 uint64_t id,
+                                 uint64_t window,
+                                 RuntimeRangeLockSet *lock_set,
+                                 char *errbuf,
+                                 size_t errbuf_size)
+{
+    uint64_t start_id;
+    uint64_t end_id;
+    uint64_t current_id;
+    size_t i;
+
+    if (table == NULL || lock_set == NULL || !table->locks_initialized || table->range_locks == NULL) {
+        set_error(errbuf, errbuf_size, "EXEC ERROR: invalid range lock arguments");
+        return STATUS_EXEC_ERROR;
+    }
+
+    memset(lock_set, 0, sizeof(*lock_set));
+    if (id == 0U) {
+        set_error(errbuf, errbuf_size, "EXEC ERROR: invalid range lock id");
+        return STATUS_EXEC_ERROR;
+    }
+
+    start_id = id > window ? id - window : 1U;
+    end_id = UINT64_MAX - id < window ? UINT64_MAX : id + window;
+
+    if (window >= TABLE_RUNTIME_RANGE_LOCK_COUNT) {
+        for (i = 0U; i < TABLE_RUNTIME_RANGE_LOCK_COUNT; ++i) {
+            if (!add_range_lock_index(lock_set, i)) {
+                set_error(errbuf, errbuf_size, "EXEC ERROR: failed to build range lock set");
+                return STATUS_EXEC_ERROR;
+            }
+        }
+    } else {
+        current_id = start_id;
+        while (1) {
+            size_t index = (size_t)(current_id % TABLE_RUNTIME_RANGE_LOCK_COUNT);
+
+            if (!add_range_lock_index(lock_set, index)) {
+                set_error(errbuf, errbuf_size, "EXEC ERROR: failed to build range lock set");
+                return STATUS_EXEC_ERROR;
+            }
+            if (current_id == end_id) {
+                break;
+            }
+            current_id += 1U;
+        }
+    }
+
+    for (i = 0U; i < lock_set->count; ++i) {
+        if (pthread_mutex_lock(&table->range_locks[lock_set->indices[i]]) != 0) {
+            size_t unlock_index;
+
+            for (unlock_index = i; unlock_index > 0U; --unlock_index) {
+                pthread_mutex_unlock(&table->range_locks[lock_set->indices[unlock_index - 1U]]);
+            }
+            memset(lock_set, 0, sizeof(*lock_set));
+            set_error(errbuf, errbuf_size, "EXEC ERROR: failed to acquire range lock");
+            return STATUS_EXEC_ERROR;
+        }
+    }
+
+    return STATUS_OK;
+}
+
+/* table_runtime_lock_id_window()로 잡은 stripe lock들을 역순으로 해제한다. */
+void table_runtime_unlock_id_window(TableRuntime *table,
+                                    const RuntimeRangeLockSet *lock_set)
+{
+    size_t i;
+
+    if (table == NULL || lock_set == NULL || table->range_locks == NULL) {
+        return;
+    }
+
+    for (i = lock_set->count; i > 0U; --i) {
+        pthread_mutex_unlock(&table->range_locks[lock_set->indices[i - 1U]]);
+    }
+}
+
 /* ctx가 보유한 모든 table runtime과 그 안의 schema/B+Tree 메모리를 해제한다. */
 void free_execution_context(ExecutionContext *ctx)
 {
@@ -348,9 +593,7 @@ void free_execution_context(ExecutionContext *ctx)
     }
 
     for (i = 0U; i < ctx->table_count; ++i) {
-        free(ctx->tables[i].table_name);
-        free_table_schema(&ctx->tables[i].schema);
-        bptree_destroy(&ctx->tables[i].id_index);
+        free_table_runtime_contents(&ctx->tables[i]);
     }
 
     free(ctx->tables);

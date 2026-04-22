@@ -255,9 +255,20 @@ static int run_select(DbApi *api, const Statement *stmt, ExecResult *result, cha
 static int run_insert(DbApi *api, const Statement *stmt, ExecResult *result, char *errbuf, size_t errbuf_size)
 {
     int status;
+    const char *table_name = stmt->insert_stmt.table_name;
 
     if (pthread_rwlock_wrlock(&api->rwlock) != 0) {
-        snprintf(errbuf, errbuf_size, "failed to acquire write lock");
+        snprintf(errbuf, errbuf_size, "failed to acquire preload lock");
+        return STATUS_EXEC_ERROR;
+    }
+    status = runtime_preload_table(&api->ctx, table_name, errbuf, errbuf_size);
+    pthread_rwlock_unlock(&api->rwlock);
+    if (status != STATUS_OK) {
+        return status;
+    }
+
+    if (pthread_rwlock_rdlock(&api->rwlock) != 0) {
+        snprintf(errbuf, errbuf_size, "failed to acquire read lock");
         return STATUS_EXEC_ERROR;
     }
     status = execute_statement(&api->ctx, stmt, result, errbuf, errbuf_size);

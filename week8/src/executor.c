@@ -740,7 +740,13 @@ static int execute_select_with_id_index(ExecutionContext *ctx,
         return status;
     }
 
+    if (pthread_rwlock_rdlock(table->index_lock) != 0) {
+        free_query_result_contents(&out_result->query_result);
+        set_error(errbuf, errbuf_size, "EXEC ERROR: failed to acquire index read lock");
+        return STATUS_EXEC_ERROR;
+    }
     status = bptree_search(&table->id_index, id_key, &row_offset, &found, errbuf, errbuf_size);
+    pthread_rwlock_unlock(table->index_lock);
     if (status != STATUS_OK) {
         free_query_result_contents(&out_result->query_result);
         return translate_module_status(status, STATUS_INDEX_ERROR, "INDEX ERROR", errbuf, errbuf_size);
@@ -751,8 +757,14 @@ static int execute_select_with_id_index(ExecutionContext *ctx,
         return STATUS_OK;
     }
 
+    if (pthread_rwlock_rdlock(table->data_lock) != 0) {
+        free_query_result_contents(&out_result->query_result);
+        set_error(errbuf, errbuf_size, "EXEC ERROR: failed to acquire data read lock");
+        return STATUS_EXEC_ERROR;
+    }
     status = read_row_at_offset(ctx->db_dir, table->table_name, row_offset,
                                 table->schema.column_count, &source_row, errbuf, errbuf_size);
+    pthread_rwlock_unlock(table->data_lock);
     if (status != STATUS_OK) {
         free_query_result_contents(&out_result->query_result);
         return translate_module_status(status, STATUS_STORAGE_ERROR, "STORAGE ERROR", errbuf, errbuf_size);
@@ -802,9 +814,15 @@ static int execute_select_with_full_scan(ExecutionContext *ctx,
         ? schema_find_column_index(&table->schema, stmt->where_clause.column_name)
         : -1;
 
+    if (pthread_rwlock_rdlock(table->data_lock) != 0) {
+        free_query_result_contents(&out_result->query_result);
+        set_error(errbuf, errbuf_size, "EXEC ERROR: failed to acquire data read lock");
+        return STATUS_EXEC_ERROR;
+    }
     status = scan_table_rows_with_offsets(ctx->db_dir, table->table_name, table->schema.column_count,
                                           select_full_scan_callback, &state,
                                           errbuf, errbuf_size);
+    pthread_rwlock_unlock(table->data_lock);
     if (status != STATUS_OK) {
         free_query_result_contents(&out_result->query_result);
         return translate_module_status(status, STATUS_STORAGE_ERROR, "STORAGE ERROR", errbuf, errbuf_size);
@@ -839,38 +857,78 @@ static int execute_insert(ExecutionContext *ctx, const InsertStatement *stmt,
     }
 
     if (table->has_id_column) {
+        RuntimeRangeLockSet range_lock_set = {{0}, 0U};
         uint64_t generated_id;
+        int range_locked = 0;
 
         status = validate_insert_columns_for_auto_id(table, stmt, errbuf, errbuf_size);
         if (status != STATUS_OK) {
             return status;
         }
 
+        if (pthread_mutex_lock(table->next_id_lock) != 0) {
+            set_error(errbuf, errbuf_size, "EXEC ERROR: failed to acquire next-id lock");
+            return STATUS_EXEC_ERROR;
+        }
         generated_id = table->next_id;
-        if (generated_id == 0U) {
+        if (generated_id == 0U || generated_id == UINT64_MAX) {
+            pthread_mutex_unlock(table->next_id_lock);
             set_error(errbuf, errbuf_size, "EXEC ERROR: auto-generated id overflow");
             return STATUS_EXEC_ERROR;
         }
+        table->next_id += 1U;
+        pthread_mutex_unlock(table->next_id_lock);
 
         status = build_insert_row_with_generated_id(table, stmt, generated_id, &row, errbuf, errbuf_size);
         if (status != STATUS_OK) {
             return status;
         }
 
-        status = append_row_to_table_with_offset(ctx->db_dir, stmt->table_name, &row, &row_offset, errbuf, errbuf_size);
+        status = table_runtime_lock_id_window(table, generated_id, TABLE_RUNTIME_INSERT_RANGE_WINDOW,
+                                              &range_lock_set, errbuf, errbuf_size);
         if (status != STATUS_OK) {
+            free_row(&row);
+            return status;
+        }
+        range_locked = 1;
+
+        if (pthread_rwlock_wrlock(table->data_lock) != 0) {
+            table_runtime_unlock_id_window(table, &range_lock_set);
+            free_row(&row);
+            set_error(errbuf, errbuf_size, "EXEC ERROR: failed to acquire data write lock");
+            return STATUS_EXEC_ERROR;
+        }
+        status = append_row_to_table_with_offset(ctx->db_dir, stmt->table_name, &row, &row_offset, errbuf, errbuf_size);
+        pthread_rwlock_unlock(table->data_lock);
+        if (status != STATUS_OK) {
+            if (range_locked) {
+                table_runtime_unlock_id_window(table, &range_lock_set);
+            }
             free_row(&row);
             return translate_module_status(status, STATUS_STORAGE_ERROR, "STORAGE ERROR", errbuf, errbuf_size);
         }
 
+        if (pthread_rwlock_wrlock(table->index_lock) != 0) {
+            if (range_locked) {
+                table_runtime_unlock_id_window(table, &range_lock_set);
+            }
+            free_row(&row);
+            set_error(errbuf, errbuf_size, "EXEC ERROR: failed to acquire index write lock");
+            return STATUS_EXEC_ERROR;
+        }
         status = bptree_insert(&table->id_index, generated_id, row_offset, errbuf, errbuf_size);
+        if (status == STATUS_OK) {
+            table->id_index_ready = 1;
+        }
+        pthread_rwlock_unlock(table->index_lock);
+        if (range_locked) {
+            table_runtime_unlock_id_window(table, &range_lock_set);
+        }
         free_row(&row);
         if (status != STATUS_OK) {
             return translate_module_status(status, STATUS_INDEX_ERROR, "INDEX ERROR", errbuf, errbuf_size);
         }
 
-        table->next_id += 1U;
-        table->id_index_ready = 1;
         out_result->type = RESULT_INSERT;
         out_result->affected_rows = 1U;
         out_result->has_generated_id = 1;
@@ -883,7 +941,13 @@ static int execute_insert(ExecutionContext *ctx, const InsertStatement *stmt,
         return status;
     }
 
+    if (pthread_rwlock_wrlock(table->data_lock) != 0) {
+        free_row(&row);
+        set_error(errbuf, errbuf_size, "EXEC ERROR: failed to acquire data write lock");
+        return STATUS_EXEC_ERROR;
+    }
     status = append_row_to_table(ctx->db_dir, stmt->table_name, &row, errbuf, errbuf_size);
+    pthread_rwlock_unlock(table->data_lock);
     free_row(&row);
     if (status != STATUS_OK) {
         return translate_module_status(status, STATUS_STORAGE_ERROR, "STORAGE ERROR", errbuf, errbuf_size);
@@ -902,6 +966,7 @@ static int execute_select(ExecutionContext *ctx, const SelectStatement *stmt,
     TableRuntime *table = NULL;
     uint64_t id_key = 0U;
     int status;
+    int use_index;
 
     status = get_or_load_table_runtime(ctx, stmt->table_name, &table, errbuf, errbuf_size);
     if (status != STATUS_OK) {
@@ -922,7 +987,14 @@ static int execute_select(ExecutionContext *ctx, const SelectStatement *stmt,
         return status;
     }
 
-    if (can_use_id_index(table, stmt, &id_key)) {
+    if (pthread_rwlock_rdlock(table->index_lock) != 0) {
+        set_error(errbuf, errbuf_size, "EXEC ERROR: failed to acquire index read lock");
+        return STATUS_EXEC_ERROR;
+    }
+    use_index = can_use_id_index(table, stmt, &id_key);
+    pthread_rwlock_unlock(table->index_lock);
+
+    if (use_index) {
         status = execute_select_with_id_index(ctx, table, stmt, id_key, out_result, errbuf, errbuf_size);
     } else {
         status = execute_select_with_full_scan(ctx, table, stmt, out_result, errbuf, errbuf_size);
