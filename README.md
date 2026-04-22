@@ -1,3 +1,7 @@
+<img width="413" height="405" alt="스크린샷 2026-04-22 오후 10 57 29" src="https://github.com/user-attachments/assets/0240ef2d-4105-4b28-8f7c-adda71280ece" />
+
+
+
 # Mini DBMS API Server
 
 기존 CLI 기반 SQL Processor를 HTTP/JSON API 서버로 확장한 프로젝트입니다. 발표는 별도 슬라이드 없이 이 README를 기준으로 진행하며, 아래 내용은 `docs/script/발표대본.md`의 단계 흐름에 맞춰 구성했습니다.
