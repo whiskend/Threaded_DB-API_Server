@@ -42,6 +42,14 @@ int get_or_load_table_runtime(ExecutionContext *ctx,
                               char *errbuf, size_t errbuf_size);
 
 /*
+ * table runtime을 미리 로드하는 공개 래퍼 함수다.
+ * 반드시 write lock을 잡은 상태에서만 호출해야 한다.
+ */
+int runtime_preload_table(ExecutionContext *ctx,
+                          const char *table_name,
+                          char *errbuf, size_t errbuf_size);
+
+/*
  * schema와 id_column_index를 기준으로 data 파일을 스캔해 out_tree를 채우고,
  * 다음 auto-generated id를 out_next_id에 계산해 넣은 뒤 상태 코드를 반환한다.
  */

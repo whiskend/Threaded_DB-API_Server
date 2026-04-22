@@ -327,6 +327,16 @@ int get_or_load_table_runtime(ExecutionContext *ctx,
     return STATUS_OK;
 }
 
+/* write lock 하에서 table runtime을 미리 로드해 이후 read path가 재사용하게 만든다. */
+int runtime_preload_table(ExecutionContext *ctx,
+                          const char *table_name,
+                          char *errbuf, size_t errbuf_size)
+{
+    TableRuntime *table = NULL;
+
+    return get_or_load_table_runtime(ctx, table_name, &table, errbuf, errbuf_size);
+}
+
 /* ctx가 보유한 모든 table runtime과 그 안의 schema/B+Tree 메모리를 해제한다. */
 void free_execution_context(ExecutionContext *ctx)
 {

@@ -1,50 +1,77 @@
 CC := clang
-CFLAGS := -std=c99 -Wall -Wextra -Werror -Iinclude
 BUILD_DIR := build
 
-SRC_FILES := $(wildcard src/*.c)
-LIB_SRC_FILES := $(filter-out src/main.c,$(SRC_FILES))
-LIB_OBJECTS := $(patsubst src/%.c,$(BUILD_DIR)/%.o,$(LIB_SRC_FILES))
-APP_OBJECTS := $(patsubst src/%.c,$(BUILD_DIR)/%.o,$(SRC_FILES))
-TEST_SOURCES := $(wildcard tests/test_*.c)
+CFLAGS_COMMON := -std=c99 -Wall -Wextra -Werror -Iinclude
+CFLAGS_SERVER := $(CFLAGS_COMMON) -D_XOPEN_SOURCE=700 -pthread
+
+ENGINE_SRCS := \
+	src/utils.c \
+	src/lexer.c \
+	src/parser.c \
+	src/schema.c \
+	src/storage.c \
+	src/runtime.c \
+	src/executor.c \
+	src/result.c \
+	src/bptree.c \
+	src/benchmark.c
+
+CLI_SRCS := \
+	src/main.c \
+	src/cli.c
+
+SERVER_SRCS := \
+	src/server_main.c \
+	src/server.c \
+	src/http.c \
+	src/thread_pool.c \
+	src/task_queue.c \
+	src/db_api.c \
+	src/json_parser.c \
+	src/json_writer.c
+
+ENGINE_OBJECTS := $(patsubst src/%.c,$(BUILD_DIR)/%.o,$(ENGINE_SRCS))
+CLI_OBJECTS := $(patsubst src/%.c,$(BUILD_DIR)/%.o,$(CLI_SRCS))
+SERVER_OBJECTS := $(patsubst src/%.c,$(BUILD_DIR)/server_%.o,$(SERVER_SRCS))
+
+TEST_SOURCES := $(sort $(wildcard tests/test_*.c))
 TEST_BINS := $(patsubst tests/%.c,$(BUILD_DIR)/%,$(TEST_SOURCES))
-TEST_SHELLS := $(wildcard tests/test_*.sh)
-TOOL_SOURCES := $(wildcard tools/*.c)
+TEST_SHELLS := $(sort $(wildcard tests/test_*.sh))
+TOOL_SOURCES := $(sort $(wildcard tools/*.c))
 TOOL_BINS := $(patsubst tools/%.c,$(BUILD_DIR)/%,$(TOOL_SOURCES))
-
-FULL_APP_SRCS := src/main.c src/schema.c src/storage.c src/executor.c src/result.c src/runtime.c src/bptree.c src/benchmark.c
-APP_TARGET :=
-
-ifeq ($(words $(wildcard $(FULL_APP_SRCS))),$(words $(FULL_APP_SRCS)))
-APP_TARGET := sql_processor
-endif
 
 .PHONY: all test clean
 
-all: $(TEST_BINS) $(APP_TARGET) $(TOOL_BINS)
+all: $(TEST_BINS) sql_processor mini_db_server $(TOOL_BINS)
 
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
 
 $(BUILD_DIR)/%.o: src/%.c | $(BUILD_DIR)
-	$(CC) $(CFLAGS) -c $< -o $@
+	$(CC) $(CFLAGS_COMMON) -c $< -o $@
 
-$(BUILD_DIR)/test_%: tests/test_%.c $(LIB_OBJECTS) | $(BUILD_DIR)
-	$(CC) $(CFLAGS) $(LIB_OBJECTS) $< -o $@
+$(BUILD_DIR)/server_%.o: src/%.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS_SERVER) -c $< -o $@
 
-$(BUILD_DIR)/%: tools/%.c $(LIB_OBJECTS) | $(BUILD_DIR)
-	$(CC) $(CFLAGS) $(LIB_OBJECTS) $< -o $@
+$(BUILD_DIR)/test_%: tests/test_%.c $(ENGINE_OBJECTS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS_COMMON) $(ENGINE_OBJECTS) $< -o $@
 
-sql_processor: $(APP_OBJECTS)
-	$(CC) $(CFLAGS) $(APP_OBJECTS) -o $@
+$(BUILD_DIR)/%: tools/%.c $(ENGINE_OBJECTS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS_COMMON) $(ENGINE_OBJECTS) $< -o $@
 
-test: $(TEST_BINS) $(APP_TARGET)
-	@for bin in $(TEST_BINS); do \
+sql_processor: $(ENGINE_OBJECTS) $(CLI_OBJECTS)
+	$(CC) $(CFLAGS_COMMON) $(ENGINE_OBJECTS) $(CLI_OBJECTS) -o $@
+
+mini_db_server: $(ENGINE_OBJECTS) $(SERVER_OBJECTS)
+	$(CC) $(CFLAGS_SERVER) $(ENGINE_OBJECTS) $(SERVER_OBJECTS) -o $@
+
+test: $(TEST_BINS) sql_processor mini_db_server
+	@set -e; for bin in $(TEST_BINS); do \
 		$$bin; \
 	done
-	@for script in $(TEST_SHELLS); do \
+	@set -e; for script in $(TEST_SHELLS); do \
 		sh $$script; \
 	done
 
 clean:
-	rm -rf $(BUILD_DIR) sql_processor
+	rm -rf $(BUILD_DIR) sql_processor mini_db_server
