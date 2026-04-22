@@ -103,7 +103,7 @@ tests/bench_api_server.sh
 - repeat runs: `3`
 - concurrency: `64`
 - workers: `1 2 4 8`
-- queue size: `32 64 128`
+- queue size: `64 128`
 - workload: `select-only insert-only mixed`
 
 `concurrency`는 벤치마크에서 동시에 몇 개의 요청을 서버에 보내는지 뜻합니다.
