@@ -124,12 +124,14 @@ flowchart TD
 
 ### 왜 preload가 필요한가
 
-- 첫 `SELECT`도 runtime cache를 수정할 수 있습니다.
-- 이 과정에는 아래 작업이 포함될 수 있습니다.
-  - schema load
+- 쉽게 말하면, 처음 읽는 테이블은 조회 전에 준비 작업이 필요합니다.
+- 이때 여러 `SELECT`가 동시에 처음 들어오면 같은 준비 작업을 여러 번 하거나, 공유 캐시를 동시에 건드릴 수 있습니다.
+- 그래서 처음 준비 단계는 잠깐 쓰기 잠금으로 막아 한 번만 안전하게 끝내고, 준비가 끝난 뒤에는 읽기 잠금으로 여러 조회를 같이 실행합니다.
+- 이 준비 작업에는 아래 내용이 포함될 수 있습니다.
+  - schema 읽기
   - `.data` 확인
-  - B+Tree rebuild
-  - runtime cache append
+  - B+Tree 다시 만들기
+  - 공유 캐시에 등록
 - 그래서 완전 무잠금 `SELECT`는 쓰지 않고, preload 후 read lock 정책을 사용합니다.
 
 ### 왜 `pthread_rwlock_t`인가
@@ -154,6 +156,7 @@ make
 - `./mini_db_server`
 - `./build/test_*`
 - `./build/benchmark_bptree`
+- `./build/*.o`
 
 ### Test
 
@@ -296,25 +299,6 @@ SELECT 응답 예시:
 - full HTTP/1.1 기능
 - chunked body
 
-### 주요 에러 코드
-
-- `INVALID_JSON`
-- `MISSING_SQL_FIELD`
-- `EMPTY_QUERY`
-- `MULTI_STATEMENT_NOT_ALLOWED`
-- `UNSUPPORTED_QUERY`
-- `SQL_PARSE_ERROR`
-- `SCHEMA_ERROR`
-- `STORAGE_ERROR`
-- `INDEX_ERROR`
-- `EXECUTION_ERROR`
-- `QUEUE_FULL`
-- `BAD_REQUEST`
-- `NOT_FOUND`
-- `METHOD_NOT_ALLOWED`
-- `PAYLOAD_TOO_LARGE`
-- `INTERNAL_ERROR`
-
 ## 5. 시행착오와 배운 점
 
 이 섹션은 현재 기본 구현과 별도로, 프로젝트를 진행하면서 확인한 시행착오를 요약한 것입니다.
@@ -337,22 +321,27 @@ flowchart LR
   - worker를 늘려도 항상 성능이 좋아지지 않았습니다.
   - 어떤 조합에서는 worker가 적은 쪽이 더 빨랐습니다.
 - 이유:
-  - 현재 기본 구현은 correctness를 우선한 전역 `pthread_rwlock_t` 기반입니다.
+  - 현재 기본 구현은 정합성을 우선한 전역 `pthread_rwlock_t` 기반입니다.
   - `INSERT`는 write lock으로 직렬화됩니다.
-  - `SELECT`도 preload 단계에서는 write lock을 거칩니다.
-  - workload가 짧으면 SQL 실행 시간보다 queue, lock, context switch 오버헤드가 더 크게 보일 수 있습니다.
+  - `SELECT`도 preload 단계에서 write lock을 한 번 거치지만, 이 구간은 짧아서 그 자체가 항상 큰 손해로 나타난 것은 아니었습니다.
+  - 오히려 worker 수를 늘릴수록 queue 관리, lock 경쟁, context switch 같은 오버헤드가 더 커졌습니다.
+  - 그래서 workload가 짧으면 SQL 실행 시간보다 이런 오버헤드가 더 크게 보일 수 있습니다.
 
 ### 여기서 배운 점
 
 - 멀티스레딩은 무조건 더 빠른 기술이 아닙니다.
-- 속도는 thread 수보다 `lock granularity`, 공유 상태, 작업 길이에 더 크게 영향을 받습니다.
+- 속도는 thread 수보다 락을 거는 범위, 공유 상태, 작업 길이에 더 크게 영향을 받습니다.
 - 서버에서 멀티스레딩의 가치는 단일 요청 1개를 극단적으로 빠르게 끝내는 것보다, 여러 요청을 동시에 받아도 시스템이 버티게 하는 데 더 가깝습니다.
+- 성능 benchmark에서 병렬성이 좋아졌다는 사실만으로, 현재 코드베이스의 정합성까지 자동으로 증명되는 것은 아닙니다.
 
 ### 후속 실험
 
 - 별도 실험에서는 lock 범위를 더 좁히는 방식도 검토했습니다.
 - 그 경우 서로 덜 충돌하는 요청이 동시에 통과할 수 있어서, worker 수가 많은 구성이 더 유리한 결과도 확인했습니다.
-- 다만 현재 repo의 기본 구현은 여전히 전역 `rwlock` 기반 MVP입니다.
+- 이 결과는 "전역 lock contention이 실제 병목이었다"는 점을 보여주는 성능 실험으로는 의미가 있습니다.
+- 하지만 현재 엔진의 write path는 단일 row만 수정하는 것이 아니라 `.data` append, `next_id` 증가, in-memory B+Tree 갱신, runtime cache 재사용 같은 더 넓은 공유 상태를 함께 다룹니다.
+- 따라서 row-level에 가까운 더 잘게 나눈 락이 성능상 이점이 있더라도, 현재 코드 구조에서 바로 기본 구현으로 채택하면 정합성 설명과 검증 비용이 크게 증가합니다.
+- 그래서 기본 구현은 정합성을 우선한 전역 `rwlock` 기반 MVP로 유지했고, 더 잘게 나눈 락 방식은 별도 자료구조 설계와 정합성 검증이 필요한 후속 과제로 남겼습니다.
 
 ## 6. Benchmark
 
@@ -376,16 +365,6 @@ sh tests/bench_api_server.sh
 - `build/bench_api_server_results.tsv`
 - `build/bench_api_server_runs.tsv`
 
-자주 쓰는 환경 변수:
-
-- `REQUESTS_PER_RUN`
-- `RUNS_PER_CASE`
-- `CONCURRENCY`
-- `WORKERS_LIST`
-- `QUEUE_SIZES`
-- `WORKLOADS`
-- `SEED_ROWS`
-
 예시:
 
 ```bash
@@ -397,9 +376,10 @@ SEED_ROWS=5000 sh tests/bench_api_server.sh
 ## 제한 사항
 
 - 구현 범위는 MVP에 맞춰 좁게 유지했습니다.
-- write는 coarse-grained lock으로 보호합니다.
-- read path도 preload 단계에서는 write lock을 사용합니다.
-- workload가 매우 짧으면 thread/queue/lock 오버헤드가 더 크게 보일 수 있습니다.
+- 쓰기 작업은 넓은 범위를 한 번에 잠그는 방식으로 보호합니다.
+- 읽기 처리 흐름도 preload 단계에서는 쓰기 잠금을 사용합니다.
+- 더 잘게 나눈 락 실험은 병렬성 향상 가능성을 보여줬지만, 현재 엔진의 `next_id`, `.data` append, B+Tree, 공유 캐시까지 함께 안전하게 보호하는 구조로는 아직 일반화하지 않았습니다.
+- 작업이 매우 짧으면 스레드, 큐, 락 오버헤드가 더 크게 보일 수 있습니다.
 
 ## 참고
 
