@@ -1,0 +1,50 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="760" viewBox="0 0 1000 760">
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#111827" />
+    </marker>
+    <style>
+      .bg { fill: #f8fafc; }
+      .box { fill: #ffffff; stroke: #111827; stroke-width: 2; }
+      .title { font: 700 24px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #111827; }
+      .body { font: 500 17px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #374151; }
+      .arrow { stroke: #111827; stroke-width: 2.4; fill: none; marker-end: url(#arrow); }
+      .line { stroke: #111827; stroke-width: 2.4; fill: none; }
+    </style>
+  </defs>
+
+  <rect class="bg" x="0" y="0" width="1000" height="760" />
+
+  <rect class="box" x="390" y="40" width="220" height="70" rx="8" />
+  <text class="title" x="455" y="83">SQL 입력</text>
+
+  <path class="arrow" d="M500 110 L500 150" />
+
+  <rect class="box" x="390" y="150" width="220" height="70" rx="8" />
+  <text class="title" x="426" y="193">Lexer / Parser</text>
+
+  <path class="arrow" d="M500 220 L500 260" />
+
+  <rect class="box" x="390" y="260" width="220" height="70" rx="8" />
+  <text class="title" x="445" y="303">Executor</text>
+
+  <path class="line" d="M500 330 L500 370" />
+  <path class="line" d="M250 370 L750 370" />
+  <path class="arrow" d="M250 370 L250 430" />
+  <path class="arrow" d="M750 370 L750 430" />
+
+  <rect class="box" x="120" y="430" width="260" height="95" rx="8" />
+  <text class="title" x="209" y="468">Storage</text>
+  <text class="body" x="188" y="497">.schema / .data</text>
+
+  <rect class="box" x="620" y="430" width="260" height="95" rx="8" />
+  <text class="title" x="681" y="468">B+Tree Index</text>
+  <text class="body" x="678" y="497">id -> row_offset</text>
+
+  <path class="arrow" d="M620 478 L380 478" />
+
+  <path class="arrow" d="M250 525 L250 650 L420 650" />
+
+  <rect class="box" x="420" y="615" width="160" height="70" rx="8" />
+  <text class="title" x="462" y="658">결과</text>
+</svg>

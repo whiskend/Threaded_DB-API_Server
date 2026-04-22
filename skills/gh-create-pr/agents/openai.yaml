@@ -1,0 +1,4 @@
+interface:
+  display_name: "GitHub PR Creator"
+  short_description: "Ask first, then create prefixed Korean PR"
+  default_prompt: "Use $gh-create-pr to first ask me for a PR title, PR description, and type prefix, turn them into a polished Korean pull request, format the final title like feat: ..., assign it to me, and include a Closes #issue footer based on the current type-#issue branch."

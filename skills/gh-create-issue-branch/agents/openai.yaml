@@ -1,0 +1,4 @@
+interface:
+  display_name: "GitHub Issue Branch"
+  short_description: "Ask first, then create Korean issue + feat-# branch"
+  default_prompt: "Use $gh-create-issue-branch to first ask me for an issue title and issue description, turn them into a polished Korean GitHub issue, prepend a type like feat: to the final issue title, assign it to me by default, create a matching feat-#123 branch with gh, push it to origin, switch to it, and continue the work there."
