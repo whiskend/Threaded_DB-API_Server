@@ -102,7 +102,7 @@ tests/bench_api_server.sh
 - requests per run: `2000`
 - repeat runs: `3`
 - concurrency: `64`
-- workers: `2 4 8`
+- workers: `1 2 4 8`
 - queue size: `32 64 128`
 - workload: `select-only insert-only mixed`
 
