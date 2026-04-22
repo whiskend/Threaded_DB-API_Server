@@ -106,6 +106,9 @@ tests/bench_api_server.sh
 - queue size: `32 64 128`
 - workload: `select-only insert-only mixed`
 
+`concurrency`는 벤치마크에서 동시에 몇 개의 요청을 서버에 보내는지 뜻합니다.
+동시 요청이 몰릴 때 서버가 실제로 얼마나 버티는지, queue가 차서 `503`이 나는지, worker 수를 늘리는 게 효과 있는지를 보려고 필요합니다.
+
 결과 파일:
 
 ```text
