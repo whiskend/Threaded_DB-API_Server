@@ -502,7 +502,7 @@ int runtime_preload_table(ExecutionContext *ctx,
     return get_or_load_table_runtime(ctx, table_name, &table, errbuf, errbuf_size);
 }
 
-/* id 기준 앞뒤 window 범위에 대응하는 stripe lock들을 deadlock 없이 잡는다. */
+/* id 기준 window 범위에 대응하는 stripe lock들을 deadlock 없이 잡는다. window=0이면 해당 row id만 잡는다. */
 int table_runtime_lock_id_window(TableRuntime *table,
                                  uint64_t id,
                                  uint64_t window,

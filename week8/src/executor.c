@@ -884,7 +884,7 @@ static int execute_insert(ExecutionContext *ctx, const InsertStatement *stmt,
             return status;
         }
 
-        status = table_runtime_lock_id_window(table, generated_id, TABLE_RUNTIME_INSERT_RANGE_WINDOW,
+        status = table_runtime_lock_id_window(table, generated_id, TABLE_RUNTIME_INSERT_ROW_LOCK_WINDOW,
                                               &range_lock_set, errbuf, errbuf_size);
         if (status != STATUS_OK) {
             free_row(&row);

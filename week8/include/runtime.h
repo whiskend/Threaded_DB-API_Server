@@ -10,7 +10,7 @@
 #include "schema.h"
 
 #define TABLE_RUNTIME_RANGE_LOCK_COUNT 64U
-#define TABLE_RUNTIME_INSERT_RANGE_WINDOW 5U
+#define TABLE_RUNTIME_INSERT_ROW_LOCK_WINDOW 0U
 
 typedef struct {
     size_t indices[TABLE_RUNTIME_RANGE_LOCK_COUNT];
