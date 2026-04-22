@@ -57,12 +57,6 @@ flowchart LR
   - `ExecResult`를 JSON으로 변환
   - 내부 오류를 HTTP 상태 코드와 에러 코드로 매핑
 
-### AST 재사용
-
-- SQL은 `db_api.c`에서 한 번만 파싱합니다.
-- parser가 만든 AST를 정책 판단에도 쓰고, 그대로 `execute_statement()`에 넘깁니다.
-- 중복 파싱이 없고, 기존 executor와도 자연스럽게 연결됩니다.
-
 ## 3. 아키텍처와 동시성
 
 ### 요청 처리 흐름
