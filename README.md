@@ -13,16 +13,6 @@
 - 새로 추가한 핵심은 HTTP 서버, thread pool, bounded queue, `db_api.c`입니다.
 - 목표는 기능 확장보다 `API 서버 연결`, `병렬 요청 처리`, `동시성 제어`를 보여주는 것입니다.
 
-```mermaid
-flowchart LR
-    Client["Client"] -->|"HTTP/JSON"| Server["mini_db_server"]
-    Server --> Queue["Bounded Queue"]
-    Queue --> Workers["Worker Threads"]
-    Workers --> Api["db_api.c"]
-    Api --> Engine["lexer + parser + executor"]
-    Engine --> Storage["storage + runtime + B+Tree"]
-```
-
 ### 핵심 포인트
 
 - `SELECT ... WHERE id = ?`는 B+Tree 인덱스를 사용할 수 있습니다.
@@ -60,6 +50,16 @@ flowchart LR
 ## 3. 아키텍처와 동시성
 
 ### 요청 처리 흐름
+
+```mermaid
+flowchart LR
+    Client["Client"] -->|"HTTP/JSON"| Server["mini_db_server"]
+    Server --> Queue["Bounded Queue"]
+    Queue --> Workers["Worker Threads"]
+    Workers --> Api["db_api.c"]
+    Api --> Engine["lexer + parser + executor"]
+    Engine --> Storage["storage + runtime + B+Tree"]
+```
 
 - main thread
   - `accept()`로 연결을 받습니다.
