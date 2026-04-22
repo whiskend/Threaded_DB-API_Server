@@ -1,290 +1,208 @@
-<img width="413" height="405" alt="스크린샷 2026-04-22 오후 10 57 29" src="https://github.com/user-attachments/assets/0240ef2d-4105-4b28-8f7c-adda71280ece" />
-
-
-
 # Mini DBMS API Server
 
-기존 CLI 기반 SQL Processor를 HTTP/JSON API 서버로 확장한 프로젝트입니다. 발표는 별도 슬라이드 없이 이 README를 기준으로 진행하며, 아래 내용은 `docs/script/발표대본.md`의 단계 흐름에 맞춰 구성했습니다.
+기존 C 기반 SQL 엔진 위에 최소 HTTP/JSON API 서버를 붙인 프로젝트입니다.
 
-## 발표 흐름
+- CLI SQL 실행기: `sql_processor`
+- HTTP API 서버: `mini_db_server`
+- 지원 SQL: `SELECT`, `INSERT`
+- 요청 제한: HTTP 요청 1개당 SQL 1문장
 
-```mermaid
-flowchart LR
-    S0["발표 전 준비"] --> S1["Step 1<br/>프로젝트 소개"]
-    S1 --> S2["Step 2<br/>설계 의사결정"]
-    S2 --> S3["Step 3<br/>아키텍처와 동시성"]
-    S3 --> S4["Step 4<br/>서버 실행"]
-    S4 --> S5["Step 5<br/>Health Check"]
-    S5 --> S6["Step 6<br/>INSERT"]
-    S6 --> S7["Step 7<br/>SELECT"]
-    S7 --> S8["Step 8<br/>단일 SQL 제한"]
-    S8 --> S9["Step 9<br/>Concurrent SELECT"]
-    S9 --> S10["Step 10<br/>Concurrent INSERT"]
-    S10 --> S11["Step 11<br/>마무리"]
-```
----
+## 1. 프로젝트 소개
 
-## Step 1. 프로젝트 소개
-
-저희 팀은 기존 DB 엔진을 재사용하면서, 그 앞에 `mini_db_server`라는 HTTP API 서버를 추가했습니다.
-
-핵심은 DB 엔진을 새로 만드는 것이 아니라, 이미 구현된 SQL 처리 흐름을 서버에서 안전하게 호출할 수 있도록 감싸는 것입니다.
+- 기존 `lexer`, `parser`, `executor`, `storage`, `B+Tree`를 재사용합니다.
+- 새로 추가한 핵심은 HTTP 서버, thread pool, bounded queue, `db_api.c`입니다.
+- 목표는 기능 확장보다 `API 서버 연결`, `병렬 요청 처리`, `동시성 제어`를 보여주는 것입니다.
 
 ```mermaid
 flowchart LR
-    Client["External Client<br/>Postman"]
-    Server["mini_db_server<br/>HTTP API Server"]
-    Engine["Existing SQL Engine<br/>lexer / parser / executor"]
-    Storage["Storage + B+Tree<br/>.schema / .data / id index"]
-
-    Client -->|"HTTP/JSON"| Server
-    Server -->|"reuse"| Engine
-    Engine --> Storage
+    Client["Client"] -->|"HTTP/JSON"| Server["mini_db_server"]
+    Server --> Queue["Bounded Queue"]
+    Queue --> Workers["Worker Threads"]
+    Workers --> Api["db_api.c"]
+    Api --> Engine["lexer + parser + executor"]
+    Engine --> Storage["storage + runtime + B+Tree"]
 ```
 
-### 기존 엔진 구성
+### 핵심 포인트
 
-| 계층 | 역할 |
+- `SELECT ... WHERE id = ?`는 B+Tree 인덱스를 사용할 수 있습니다.
+- `INSERT`는 auto-increment id를 생성하고 `.data`와 인덱스를 함께 갱신합니다.
+- main thread는 `accept()`와 queue 적재만 담당합니다.
+- 실제 HTTP 처리와 SQL 실행은 worker thread가 담당합니다.
+
+## 2. 주요 설계 의사결정
+
+### 통신 방식
+
+- `raw TCP` 대신 `HTTP/JSON`을 선택했습니다.
+- 이유:
+  - 요청과 응답 형식이 명확합니다.
+  - `curl`, Postman 같은 도구로 바로 테스트할 수 있습니다.
+  - HTTP status code로 에러를 설명하기 쉽습니다.
+
+### 요청당 SQL 개수
+
+- 요청당 SQL 1문장만 허용합니다.
+- 이유:
+  - batch를 허용하면 부분 성공, 부분 실패, 응답 형식이 복잡해집니다.
+  - MVP 범위에서는 병렬 처리와 동시성 제어에 집중하는 편이 낫다고 판단했습니다.
+
+### `db_api.c` 역할
+
+- `db_api.c`는 새 SQL 엔진이 아닙니다.
+- 역할:
+  - SQL 1문장인지 확인
+  - `SELECT` / `INSERT` 구분
+  - lock 정책 적용
+  - `ExecResult`를 JSON으로 변환
+  - 내부 오류를 HTTP 상태 코드와 에러 코드로 매핑
+
+### AST 재사용
+
+- SQL은 `db_api.c`에서 한 번만 파싱합니다.
+- parser가 만든 AST를 정책 판단에도 쓰고, 그대로 `execute_statement()`에 넘깁니다.
+- 중복 파싱이 없고, 기존 executor와도 자연스럽게 연결됩니다.
+
+## 3. 아키텍처와 동시성
+
+### 요청 처리 흐름
+
+- main thread
+  - `accept()`로 연결을 받습니다.
+  - client fd를 bounded queue에 넣습니다.
+- worker thread
+  - queue에서 작업을 꺼냅니다.
+  - HTTP 요청을 읽습니다.
+  - JSON body에서 `sql` 필드를 추출합니다.
+  - `db_api.c`를 통해 기존 SQL 엔진을 호출합니다.
+  - JSON 응답을 만들어 클라이언트에 반환합니다.
+
+### 주요 파일
+
+| 파일 | 역할 |
 | --- | --- |
-| `lexer.c` | SQL 문자열을 token stream으로 변환 |
-| `parser.c` | token stream을 `Statement` AST로 변환 |
-| `executor.c` | INSERT/SELECT 실행 |
-| `runtime.c` | `ExecutionContext`, `TableRuntime`, B+Tree index 관리 |
-| `storage.c` | `.schema`, `.data` 파일 읽기/쓰기 |
-| `bptree.c` | `id -> row_offset` in-memory index |
+| `src/server_main.c` | 서버 옵션 파싱, 기본값 설정 |
+| `src/server.c` | 소켓 accept, queue 제출, `/health`, `/query`, `QUEUE_FULL` 처리 |
+| `src/thread_pool.c` | worker thread 생성과 작업 실행 |
+| `src/task_queue.c` | bounded queue 구현 |
+| `src/db_api.c` | SQL 검증, lock 정책, JSON 응답 생성 |
+| `src/http.c` | 최소 HTTP 요청/응답 처리 |
+| `src/json_parser.c` / `src/json_writer.c` | JSON 요청 파싱 / 응답 생성 |
+| `src/lexer.c` / `src/parser.c` / `src/executor.c` | SQL 토큰화 / AST 생성 / 실행 |
+| `src/runtime.c` | table runtime cache, preload, `next_id`, id index 관리 |
+| `src/storage.c` / `src/bptree.c` | 파일 입출력 / B+Tree 인덱스 |
 
----
+### Queue 정책
 
-## Step 2. 주요 설계 의사결정
+- queue는 bounded queue입니다.
+- 기본 queue capacity는 서버 실행 기준 `64`입니다.
+- queue가 가득 차면 서버는 `503`과 `QUEUE_FULL`을 반환합니다.
+- 무제한 queue보다 메모리 사용량과 지연을 통제하기 쉽습니다.
 
-### 2-1. Raw TCP vs HTTP/JSON
+### Worker 기본값
 
-처음에는 통신 방식을 raw TCP로 할지, HTTP/JSON으로 할지 고민했습니다.
+- 서버 실행 기본값은 `worker 4개`, `queue 64`입니다.
+- 이 값은 코드 기본값이며, [src/server_main.c](/Users/liamtsy/Desktop/krafton_jungle/W08/Threaded_DB-API_Server/src/server_main.c:64) 기준으로 설정됩니다.
+- 최적값이라고 단정하지 않고, benchmark로 비교 가능한 출발점으로 사용합니다.
 
-Raw TCP는 직접 프로토콜을 설계할 수 있다는 장점이 있지만, 요청 구분 방식, 응답 포맷, 테스트 클라이언트까지 직접 정해야 합니다. 하루짜리 프로젝트 범위에서는 리스크가 큽니다.
-
-그래서 최종적으로는 Postman으로 바로 테스트할 수 있고, 요청/응답 구조와 HTTP 상태 코드를 보여주기 쉬운 HTTP/JSON을 선택했습니다.
-
-```mermaid
-flowchart TB
-    Decision["통신 방식 결정"]
-    Raw["Raw TCP"]
-    Http["HTTP/JSON"]
-
-    Raw --> RawA["요청 경계 직접 설계"]
-    Raw --> RawB["응답 포맷 직접 설계"]
-    Raw --> RawC["테스트 클라이언트 직접 준비"]
-    Raw --> RawRisk["구현 리스크 큼"]
-
-    Http --> HttpA["Postman으로 즉시 테스트"]
-    Http --> HttpB["요청/응답 구조 명확"]
-    Http --> HttpC["HTTP status code 활용"]
-    Http --> Selected["최종 선택"]
-
-    Decision --> Raw
-    Decision --> Http
-```
-
-### 2-2. 요청당 SQL 1문장만 허용
-
-한 요청에 여러 SQL을 담는 batch 방식도 고민했습니다. 하지만 batch를 허용하면 락 범위, 부분 실패 처리, 응답 형식이 한꺼번에 복잡해집니다.
-
-예를 들어 첫 번째 INSERT는 성공했는데 두 번째 SELECT에서 실패하면 어디까지 성공으로 볼지, rollback을 할지, 응답을 배열로 만들지 같은 문제가 생깁니다.
-
-그래서 이번 프로젝트에서는 요청당 SQL 1문장만 허용했습니다. 대신 여러 요청을 동시에 보내는 방식으로 병렬 처리와 동시성 제어를 검증했습니다.
-
-```mermaid
-flowchart LR
-    Request["POST /query"]
-    Count{"SQL statement count"}
-    Execute["execute normally"]
-    Reject["400<br/>MULTI_STATEMENT_NOT_ALLOWED"]
-
-    Request --> Count
-    Count -->|"1"| Execute
-    Count -->|"> 1"| Reject
-```
-
-### 2-3. 동시성 검증 방식
-
-단일 SQL만 허용해도 동시성 검증은 가능합니다. 동시성은 한 요청 안에 SQL이 여러 개 있는지보다, 여러 HTTP 요청이 동시에 들어오는지에서 발생합니다.
-
-이번 발표에서는 Postman Performance Test로 여러 virtual user가 같은 요청을 병렬로 보내는 방식으로 read-read, write-write 상황을 확인합니다.
-
-```mermaid
-flowchart TB
-    P["Postman Performance Test"]
-    VU["Virtual Users"]
-    Select["Concurrent SELECT<br/>read-read"]
-    Insert["Concurrent INSERT<br/>write-write"]
-    Mixed["Mixed workload<br/>read-write"]
-
-    P --> VU
-    VU --> Select
-    VU --> Insert
-    VU --> Mixed
-```
-
----
-
-## Step 3. 아키텍처와 동시성 설계
-
-### 3-1. 전체 구조
-
-```mermaid
-flowchart TB
-    Client["Client<br/>Postman"]
-    Server["mini_db_server"]
-    Accept["accept()"]
-    Queue["Bounded Queue"]
-    Pool["Thread Pool"]
-    Api["db_api.c"]
-    Lexer["lexer.c"]
-    Parser["parser.c"]
-    Executor["executor.c"]
-    Storage["storage.c"]
-    Tree["B+Tree"]
-
-    Client -->|"HTTP/JSON"| Server
-    Server --> Accept
-    Accept --> Queue
-    Queue --> Pool
-    Pool --> Api
-    Api --> Lexer
-    Lexer --> Parser
-    Parser --> Executor
-    Executor --> Storage
-    Executor --> Tree
-```
-
-### 3-2. `db_api.c`의 역할
-
-`db_api.c`는 새 SQL 실행기를 만드는 파일이 아닙니다. 기존 엔진을 API 서버에 연결하는 접착제 역할입니다.
-
-문법 검사는 parser가 담당하고, `db_api.c`는 API 정책을 담당합니다.
-
-```mermaid
-flowchart TB
-    Api["db_api.c"]
-    One["1. SQL 1문장인지 확인"]
-    Type["2. SELECT / INSERT 판단"]
-    Lock["3. lock 정책 결정"]
-    Json["4. ExecResult를 JSON으로 변환"]
-    Http["5. HTTP 에러 코드로 매핑"]
-
-    Api --> One --> Type --> Lock --> Json --> Http
-```
-
-한 번 파싱해서 만든 `Statement *`를 정책 판단에도 사용하고, 그대로 `execute_statement()`에 넘겨 실행합니다.
-
-```mermaid
-sequenceDiagram
-    participant API as db_api.c
-    participant L as lexer
-    participant P as parser
-    participant E as executor
-
-    API->>L: tokenize_sql(sql)
-    L-->>API: TokenArray
-    API->>P: parse_statement(tokens)
-    P-->>API: Statement AST
-    API->>API: detect SELECT or INSERT
-    API->>E: execute_statement(ctx, stmt)
-    E-->>API: ExecResult
-```
-
-### 3-3. Lock 정책
-
-동시성 쪽에서는 세 가지 선택지를 고민했습니다.
-
-| 선택지 | 장점 | 문제 |
-| --- | --- | --- |
-| SELECT 완전 무잠금 | 가장 빠를 수 있음 | 첫 SELECT도 runtime cache를 수정할 수 있어 위험 |
-| SELECT까지 write lock | 구현 단순 | DB 레벨에서 사실상 싱글 스레드 |
-| SELECT preload 후 read lock, INSERT write lock | SELECT 병렬성과 INSERT 정합성 균형 | preload 단계가 필요 |
-
-최종적으로 세 번째 방식을 선택했습니다.
+### Lock 정책
 
 ```mermaid
 flowchart TD
-    SQL["SQL request"] --> Kind{"Statement type"}
-
-    Kind -->|"SELECT"| Preload["write lock<br/>runtime preload"]
-    Preload --> Unlock["unlock"]
-    Unlock --> ReadLock["read lock"]
-    ReadLock --> SelectRun["execute SELECT"]
-    SelectRun --> ReadUnlock["read unlock"]
-
-    Kind -->|"INSERT"| WriteLock["write lock"]
-    WriteLock --> InsertRun[".data append<br/>next_id 증가<br/>B+Tree insert"]
-    InsertRun --> WriteUnlock["write unlock"]
+    Req["SQL Request"] --> Type{"Statement Type"}
+    Type -->|"SELECT"| Preload["Write lock으로 preload"]
+    Preload --> Read["Read lock으로 SELECT 실행"]
+    Type -->|"INSERT"| Write["Write lock으로 INSERT 실행"]
 ```
 
-`get_or_load_table_runtime()`이 첫 접근 때 schema load, `.data` 파일 확인, B+Tree 재구성, runtime cache append를 수행할 수 있기 때문에 첫 SELECT도 완전 무잠금으로 둘 수 없습니다.
+- `SELECT`
+  - 먼저 write lock으로 table runtime preload를 수행합니다.
+  - 그다음 read lock으로 실제 조회를 실행합니다.
+- `INSERT`
+  - write lock으로 실행합니다.
+  - `.data` append, `next_id` 증가, B+Tree 갱신을 한 번에 보호합니다.
 
-```mermaid
-flowchart LR
-    FirstSelect["첫 SELECT"]
-    LoadSchema["schema load"]
-    EnsureData[".data 확인"]
-    Rebuild["B+Tree rebuild"]
-    AppendCache["runtime cache append"]
-    Risk["shared state mutation"]
+### 왜 preload가 필요한가
 
-    FirstSelect --> LoadSchema --> EnsureData --> Rebuild --> AppendCache --> Risk
+- 첫 `SELECT`도 runtime cache를 수정할 수 있습니다.
+- 이 과정에는 아래 작업이 포함될 수 있습니다.
+  - schema load
+  - `.data` 확인
+  - B+Tree rebuild
+  - runtime cache append
+- 그래서 완전 무잠금 `SELECT`는 쓰지 않고, preload 후 read lock 정책을 사용합니다.
+
+### 왜 `pthread_rwlock_t`인가
+
+- mutex 하나로 전체 DB를 보호하면 `SELECT`도 모두 직렬화됩니다.
+- `pthread_rwlock_t`를 쓰면:
+  - 여러 `SELECT`는 read lock으로 같이 실행할 수 있습니다.
+  - `INSERT`는 write lock으로 단독 실행됩니다.
+- 즉, 구현 단순성과 병렬성 사이에서 균형을 잡기 위한 선택입니다.
+
+## 4. 실행과 API
+
+### Build
+
+```bash
+make
 ```
 
----
+생성 파일:
 
-## Step 4. 서버 실행 시연
+- `./sql_processor`
+- `./mini_db_server`
+- `./build/test_*`
+- `./build/benchmark_bptree`
 
-터미널에서 서버를 실행합니다.
+### Test
+
+```bash
+make test
+```
+
+포함 내용:
+
+- 엔진 단위 테스트
+- API 서버 쉘 테스트
+- 통합 테스트
+
+### CLI 사용
+
+```bash
+./sql_processor -d db -f queries/multi_statements.sql
+```
+
+예시 SQL:
+
+```sql
+INSERT INTO users VALUES ('Alice', 20);
+SELECT * FROM users WHERE id = 1;
+```
+
+### API 서버 실행
 
 ```bash
 ./mini_db_server -d db -p 8080 -t 4 -q 64
 ```
 
-| 옵션 | 의미 | 발표 기본값 |
+### 옵션
+
+| 옵션 | 의미 | 기본값 |
 | --- | --- | --- |
-| `-d` | DB 디렉터리 | `db` |
-| `-p` | 포트 | `8080` |
-| `-t` | worker thread 수 | `4` |
-| `-q` | queue capacity | `64` |
+| `-d`, `--db` | DB 디렉터리 | 필수 |
+| `-p`, `--port` | 포트 | `8080` |
+| `-t`, `--threads` | worker thread 수 | `4` |
+| `-q`, `--queue-size` | queue capacity | `64` |
+| `-h`, `--help` | 도움말 | 없음 |
 
-worker 수는 I/O-bound 서버라는 점을 고려했습니다. 네트워크 요청과 파일 I/O가 있기 때문에 CPU 코어 수와 정확히 같게 두기보다는, 4로 시작하고 8, 16, 32, 64를 benchmark로 비교할 수 있게 했습니다.
+### `GET /health`
 
-Queue도 64에서 시작하고 128, 256, 512, 1024 같은 값을 실험할 수 있게 했습니다. Queue에 상한을 둔 이유는 요청 폭주 시 메모리 사용량과 응답 지연이 계속 증가하는 것을 막기 위해서입니다.
-
-```mermaid
-flowchart TB
-    Main["Main Thread<br/>accept()"]
-    Queue["Bounded Queue<br/>capacity 64"]
-    W1["Worker 1"]
-    W2["Worker 2"]
-    W3["Worker 3"]
-    W4["Worker 4"]
-    Full["Queue full<br/>request rejected"]
-
-    Main -->|"enqueue"| Queue
-    Queue --> W1
-    Queue --> W2
-    Queue --> W3
-    Queue --> W4
-    Main -->|"if full"| Full
+```bash
+curl -s http://127.0.0.1:8080/health | jq
 ```
 
----
-
-## Step 5. Postman 시연 1 - Health Check
-
-Postman에서 아래 요청을 실행합니다.
-
-```text
-Method: GET
-URL: http://127.0.0.1:8080/health
-```
-
-예상 응답:
+응답 예시:
 
 ```json
 {
@@ -293,37 +211,35 @@ URL: http://127.0.0.1:8080/health
 }
 ```
 
-이 단계에서는 서버가 정상적으로 요청을 받고 JSON 응답을 주는지 확인합니다.
+### `POST /query`
 
-```mermaid
-sequenceDiagram
-    participant P as Postman
-    participant S as mini_db_server
+요청 형식:
 
-    P->>S: GET /health
-    S-->>P: 200 OK JSON
-```
-
----
-
-## Step 6. Postman 시연 2 - INSERT
-
-Postman에서 아래 요청을 실행합니다.
-
-```text
-Method: POST
-URL: http://127.0.0.1:8080/query
-
-Headers:
-Content-Type: application/json
-
-Body -> raw -> JSON:
+```json
 {
-  "sql": "INSERT INTO users VALUES ('kim', 25);"
+  "sql": "SELECT * FROM users WHERE id = 1;"
 }
 ```
 
-예상 응답:
+INSERT 예시:
+
+```bash
+curl -s -X POST http://127.0.0.1:8080/query \
+  -H "Content-Type: application/json" \
+  --data '{"sql":"INSERT INTO users VALUES ('\''Alice'\'', 20);"}' | jq
+```
+
+SELECT 예시:
+
+```bash
+curl -s -X POST http://127.0.0.1:8080/query \
+  -H "Content-Type: application/json" \
+  --data '{"sql":"SELECT * FROM users WHERE id = 1;"}' | jq
+```
+
+응답 예시는 fresh DB 또는 테스트용 빈 `users.data` 기준입니다.
+
+INSERT 응답 예시:
 
 ```json
 {
@@ -334,40 +250,7 @@ Body -> raw -> JSON:
 }
 ```
 
-`users` 테이블은 `id` 컬럼이 있기 때문에 id는 사용자가 직접 넣지 않고, 기존 DB 엔진이 자동 생성합니다. 응답의 `generated_id`로 auto-id 정책이 API 서버에서도 그대로 동작하는 것을 확인합니다.
-
-```mermaid
-flowchart LR
-    SQL["INSERT INTO users VALUES ('kim', 25)"]
-    Runtime["TableRuntime<br/>next_id = 1"]
-    Row["1|kim|25"]
-    Data["append users.data"]
-    Index["B+Tree insert<br/>1 -> row_offset"]
-    JSON["generated_id = 1"]
-
-    SQL --> Runtime --> Row --> Data --> Index --> JSON
-```
-
----
-
-## Step 7. Postman 시연 3 - SELECT
-
-Postman에서 아래 요청을 실행합니다.
-
-```text
-Method: POST
-URL: http://127.0.0.1:8080/query
-
-Headers:
-Content-Type: application/json
-
-Body -> raw -> JSON:
-{
-  "sql": "SELECT * FROM users WHERE id = 1;"
-}
-```
-
-예상 응답:
+SELECT 응답 예시:
 
 ```json
 {
@@ -376,411 +259,149 @@ Body -> raw -> JSON:
   "used_index": true,
   "row_count": 1,
   "columns": ["id", "name", "age"],
-  "rows": [["1", "kim", "25"]]
+  "rows": [["1", "Alice", "20"]]
 }
 ```
 
-응답에서 중요한 부분은 `used_index: true`입니다. 이 값은 기존 B+Tree 인덱스를 통해 row 위치를 찾았다는 뜻입니다.
-
-```mermaid
-flowchart TB
-    Select["SELECT * FROM users WHERE id = 1"]
-    Check{"WHERE id = canonical integer?"}
-    Search["bptree_search(id_index, 1)"]
-    Offset["row_offset"]
-    Read["read_row_at_offset()"]
-    Result["JSON rows"]
-    FullScan["full scan"]
-
-    Select --> Check
-    Check -->|"yes"| Search --> Offset --> Read --> Result
-    Check -->|"no"| FullScan --> Result
-```
-
-```mermaid
-flowchart LR
-    Root["Internal Node<br/>keys: [30 | 60]"]
-    L0["child0<br/>&lt; 30"]
-    L1["child1<br/>30 ~ 59"]
-    L2["child2<br/>&gt;= 60"]
-    Leaf["Leaf Node<br/>keys: [1, 2, 3]<br/>offsets: [0, 9, 18]"]
-
-    Root --> L0
-    Root --> L1
-    Root --> L2
-    L0 --> Leaf
-```
-
----
-
-## Step 8. Postman 시연 4 - 단일 SQL 제한 확인
-
-Postman에서 아래 요청을 실행합니다.
-
-```text
-Method: POST
-URL: http://127.0.0.1:8080/query
-
-Headers:
-Content-Type: application/json
-
-Body -> raw -> JSON:
-{
-  "sql": "SELECT * FROM users; SELECT * FROM users;"
-}
-```
-
-예상 응답:
+에러 응답 예시:
 
 ```json
 {
   "success": false,
   "error_code": "MULTI_STATEMENT_NOT_ALLOWED",
-  "message": "..."
+  "message": "only one SQL statement is allowed"
 }
 ```
 
-이번 MVP에서는 요청당 SQL 1문장만 허용하기 때문에, 여러 statement가 들어오면 명확하게 에러를 반환합니다.
-
-```mermaid
-flowchart TB
-    Body["SQL body"]
-    Tokenize["tokenize_sql()"]
-    Count["statement count 검사"]
-    One["1 statement<br/>execute"]
-    Many["2+ statements<br/>reject"]
-
-    Body --> Tokenize --> Count
-    Count --> One
-    Count --> Many
-```
-
----
-
-## Step 9. Postman 시연 5 - Concurrent SELECT
-
-단일 SQL만 허용한다고 해서 동시성 검증을 못 하는 것은 아닙니다. 동시성은 한 요청 안의 SQL 개수가 아니라, 여러 요청이 동시에 들어오는지에서 발생합니다.
-
-Postman Performance Test로 단일 SELECT 요청을 여러 개 동시에 보내 read-read 상황을 검증합니다.
-
-```text
-Postman Collection: Concurrent SELECT
-
-Request:
-Method: POST
-URL: http://127.0.0.1:8080/query
-
-Headers:
-Content-Type: application/json
-
-Body -> raw -> JSON:
-{
-  "sql": "SELECT * FROM users WHERE id = 1;"
-}
-```
-
-Performance Test 설정:
-
-```text
-Virtual Users: 20
-Duration: 10 seconds
-Load Profile: Fixed
-```
-
-여러 SELECT가 동시에 들어와도 preload 이후 read lock으로 안정적으로 병렬 처리되는지 확인합니다.
-
-```mermaid
-sequenceDiagram
-    participant P as Postman VUs
-    participant W1 as Worker A
-    participant W2 as Worker B
-    participant L as pthread_rwlock_t
-    participant DB as DB Engine
-
-    P->>W1: SELECT request
-    P->>W2: SELECT request
-    W1->>L: read lock
-    W2->>L: read lock
-    W1->>DB: execute SELECT
-    W2->>DB: execute SELECT
-    DB-->>W1: result
-    DB-->>W2: result
-    W1->>L: read unlock
-    W2->>L: read unlock
-```
-
----
-
-## Step 10. Postman 시연 6 - Concurrent INSERT
-
-Postman Performance Test로 단일 INSERT 요청을 여러 개 동시에 보내 write-write 상황을 검증합니다.
-
-```text
-Postman Collection: Concurrent INSERT
-
-Request:
-Method: POST
-URL: http://127.0.0.1:8080/query
-
-Headers:
-Content-Type: application/json
-
-Body -> raw -> JSON:
-{
-  "sql": "INSERT INTO users VALUES ('postman_user', 20);"
-}
-```
-
-Performance Test 설정:
-
-```text
-Virtual Users: 10
-Duration: 10 seconds
-Load Profile: Fixed
-```
-
-여러 INSERT가 동시에 들어와도 write lock 덕분에 `.data` append, `next_id`, B+Tree insert가 깨지지 않는지 확인합니다.
-
-```mermaid
-sequenceDiagram
-    participant P as Postman VUs
-    participant W1 as Worker A
-    participant W2 as Worker B
-    participant L as pthread_rwlock_t
-    participant DB as DB Engine
-
-    P->>W1: INSERT request
-    P->>W2: INSERT request
-    W1->>L: write lock
-    W1->>DB: append .data + next_id++ + B+Tree insert
-    W2->>L: write lock requested
-    Note over W2,L: waits until Writer A finishes
-    W1->>L: write unlock
-    W2->>L: write lock acquired
-    W2->>DB: append .data + next_id++ + B+Tree insert
-    W2->>L: write unlock
-```
-
-Postman Performance Test 결과 화면에서는 virtual users, requests per second, average response time, error rate 같은 지표를 확인할 수 있습니다.
-
----
-
-## Step 11. 마무리
-
-정리하면, 이 프로젝트는 기존 CLI 기반 SQL Processor를 HTTP/JSON API 서버로 확장한 작업입니다.
-
-설계상 중요한 결정은 네 가지입니다.
-
-1. Raw TCP가 아니라 HTTP/JSON을 선택해 테스트와 발표, 구현 난이도의 균형을 맞췄습니다.
-2. 요청당 SQL 1문장만 허용해 batch 처리 복잡도를 줄이고, 병렬 처리와 동시성 제어에 집중했습니다.
-3. 기존 lexer, parser, executor, runtime, storage, B+Tree를 그대로 재사용하고, `db_api.c`는 API 정책과 lock 제어를 담당하는 adapter로 분리했습니다.
-4. `pthread_rwlock_t`를 사용해 SELECT는 preload 후 read lock, INSERT는 write lock으로 처리했습니다.
-
-```mermaid
-flowchart TB
-    Summary["Mini DBMS API Server"]
-    D1["HTTP/JSON"]
-    D2["SQL 1문장 제한"]
-    D3["기존 DB 엔진 재사용"]
-    D4["pthread_rwlock_t"]
-    Benefit["SELECT 병렬성 + INSERT 정합성"]
-
-    Summary --> D1
-    Summary --> D2
-    Summary --> D3
-    Summary --> D4
-    D4 --> Benefit
-```
-
-앞으로 개선한다면 SQL batch, `/stats`, table-level lock, 더 정교한 benchmark 기반 thread/queue 튜닝, UPDATE/DELETE까지 확장할 수 있습니다.
-
----
-
-## Postman 시연 요청 모음
-
-### 1. Health Check
-
-```text
-GET http://127.0.0.1:8080/health
-```
-
-### 2. INSERT
-
-```text
-POST http://127.0.0.1:8080/query
-Content-Type: application/json
-
-{
-  "sql": "INSERT INTO users VALUES ('kim', 25);"
-}
-```
-
-### 3. SELECT
-
-```text
-POST http://127.0.0.1:8080/query
-Content-Type: application/json
-
-{
-  "sql": "SELECT * FROM users WHERE id = 1;"
-}
-```
-
-### 4. Multi Statement Error
-
-```text
-POST http://127.0.0.1:8080/query
-Content-Type: application/json
-
-{
-  "sql": "SELECT * FROM users; SELECT * FROM users;"
-}
-```
-
-### 5. Concurrent SELECT
-
-```text
-Postman Performance Test
-
-Request:
-POST http://127.0.0.1:8080/query
-
-Body:
-{
-  "sql": "SELECT * FROM users WHERE id = 1;"
-}
-
-Virtual Users: 20
-Duration: 10 seconds
-Load Profile: Fixed
-```
-
-### 6. Concurrent INSERT
-
-```text
-Postman Performance Test
-
-Request:
-POST http://127.0.0.1:8080/query
-
-Body:
-{
-  "sql": "INSERT INTO users VALUES ('postman_user', 20);"
-}
-
-Virtual Users: 10
-Duration: 10 seconds
-Load Profile: Fixed
-```
-
----
-
-## QnA 대비 답변
-
-### Q. 왜 TCP가 아니라 HTTP/JSON인가요?
-
-Raw TCP는 직접 요청 구분 방식과 응답 포맷을 설계해야 해서 구현과 설명 비용이 큽니다. 이번 프로젝트는 하루 안에 API 서버, Thread Pool, DB 엔진 연동, 동시성 제어를 보여주는 것이 핵심이었기 때문에, Postman으로 바로 테스트 가능하고 요청/응답 구조가 명확한 HTTP/JSON을 선택했습니다.
-
-### Q. 단일 SQL만 받으면 동시성 검증이 약하지 않나요?
-
-아닙니다. 동시성은 한 요청 안의 SQL 개수가 아니라 여러 요청이 동시에 들어올 때 발생합니다. Postman Performance Test로 단일 SELECT 요청 여러 개, 단일 INSERT 요청 여러 개, 그리고 SELECT/INSERT mixed workload를 동시에 보내 read-read, write-write, read-write 상황을 검증했습니다.
-
-### Q. 왜 SELECT를 완전 무잠금으로 두지 않았나요?
-
-기존 엔진은 첫 테이블 접근 때 `get_or_load_table_runtime()`에서 schema load, `.data` 확인, B+Tree rebuild, runtime cache append를 수행할 수 있습니다. 즉 첫 SELECT도 shared state를 수정할 수 있기 때문에 완전 무잠금 SELECT는 위험합니다.
-
-### Q. 왜 mutex 하나가 아니라 rwlock인가요?
-
-Mutex 하나로 전체 DB를 보호하면 구현은 쉽지만 SELECT도 모두 직렬화되어 DB 레벨에서는 싱글 스레드처럼 동작합니다. rwlock을 쓰면 여러 SELECT는 동시에 처리하고, INSERT만 단독 처리할 수 있어서 병렬성과 정합성을 모두 설명할 수 있습니다.
-
-### Q. 왜 queue에 상한을 뒀나요?
-
-상한이 없는 queue는 요청 폭주 시 메모리 사용량과 대기 시간이 계속 증가합니다. 최악의 경우 서버가 불안정해질 수 있습니다. 그래서 Bounded Queue를 두고, queue가 꽉 차면 503으로 거절하는 방식으로 시스템 안정성을 확보했습니다.
-
----
-
-## 발표용 시행착오 스토리
-
-이 파트는 발표에서 `무엇을 구현했는가`만 설명하는 대신, `어떤 가설을 세웠고 실험을 통해 무엇을 배웠는가`를 짧게 전달하기 위한 요약입니다.
+### 지원 범위
+
+지원:
+
+- `GET /health`
+- `POST /query`
+- JSON body의 top-level `sql` 문자열
+- 요청당 SQL 1문장
+- `SELECT`
+- `INSERT`
+- `WHERE id = ?` 조회
+- B+Tree 인덱스 기반 id 조회
+
+미지원:
+
+- SQL batch
+- `UPDATE`
+- `DELETE`
+- `JOIN`
+- transaction
+- full HTTP/1.1 기능
+- chunked body
+
+### 주요 에러 코드
+
+- `INVALID_JSON`
+- `MISSING_SQL_FIELD`
+- `EMPTY_QUERY`
+- `MULTI_STATEMENT_NOT_ALLOWED`
+- `UNSUPPORTED_QUERY`
+- `SQL_PARSE_ERROR`
+- `SCHEMA_ERROR`
+- `STORAGE_ERROR`
+- `INDEX_ERROR`
+- `EXECUTION_ERROR`
+- `QUEUE_FULL`
+- `BAD_REQUEST`
+- `NOT_FOUND`
+- `METHOD_NOT_ALLOWED`
+- `PAYLOAD_TOO_LARGE`
+- `INTERNAL_ERROR`
+
+## 5. 시행착오와 배운 점
+
+이 섹션은 현재 기본 구현과 별도로, 프로젝트를 진행하면서 확인한 시행착오를 요약한 것입니다.
 
 ```mermaid
 flowchart LR
-    H["가설<br/>멀티스레딩이면 무조건 더 빠르다"] --> E["실험<br/>worker / queue / workload benchmark"]
-    E --> X["반례 발견<br/>worker를 늘려도 항상 더 빠르지 않았다"]
-    X --> A["원인 분석<br/>전역 lock + 짧은 작업 + thread/queue 오버헤드"]
-    A --> L["배운 점<br/>스레드 수보다 lock 범위가 병렬성에 더 큰 영향을 준다"]
-    L --> R["후속 실험<br/>lock 범위를 더 좁혀 충돌 단위 축소"]
-    R --> I["결과 개선<br/>worker가 많은 구성이 실제로 더 유리해졌다"]
+    H["가설<br/>멀티스레딩이면 무조건 더 빠르다"] --> E["실험<br/>worker, queue, workload benchmark"]
+    E --> X["반례<br/>worker를 늘려도 항상 더 빠르지 않았다"]
+    X --> A["원인 분석<br/>전역 rwlock + 짧은 작업 + 오버헤드"]
+    A --> L["배운 점<br/>스레드 수보다 lock 범위가 더 중요하다"]
+    L --> R["후속 실험<br/>lock 범위를 더 좁혀봄"]
+    R --> I["관찰 결과<br/>멀티스레딩 이점이 더 잘 드러남"]
 ```
 
-### 1. 가설
+### 기본 구현에서 확인한 점
 
-처음에는 `멀티스레딩 서버를 만들면 싱글 스레드보다 당연히 더 빠를 것`이라고 생각했습니다. 그래서 thread pool, bounded queue, `pthread_rwlock_t`를 넣은 뒤, worker 수를 늘릴수록 throughput이 좋아지는 모습을 보여주는 것이 목표였습니다.
+- 처음 가설:
+  - 멀티스레딩이면 worker를 늘릴수록 더 빨라질 것이라고 생각했습니다.
+- 실제 관찰:
+  - worker를 늘려도 항상 성능이 좋아지지 않았습니다.
+  - 어떤 조합에서는 worker가 적은 쪽이 더 빨랐습니다.
+- 이유:
+  - 현재 기본 구현은 correctness를 우선한 전역 `pthread_rwlock_t` 기반입니다.
+  - `INSERT`는 write lock으로 직렬화됩니다.
+  - `SELECT`도 preload 단계에서는 write lock을 거칩니다.
+  - workload가 짧으면 SQL 실행 시간보다 queue, lock, context switch 오버헤드가 더 크게 보일 수 있습니다.
 
-### 2. 실험
+### 여기서 배운 점
 
-그래서 `select-only`, `insert-only`, `mixed` workload를 나누고, worker 수와 queue 크기, 동시 요청 수를 바꿔가며 benchmark를 수행했습니다. 여기서 보고 싶었던 것은 두 가지였습니다.
+- 멀티스레딩은 무조건 더 빠른 기술이 아닙니다.
+- 속도는 thread 수보다 `lock granularity`, 공유 상태, 작업 길이에 더 크게 영향을 받습니다.
+- 서버에서 멀티스레딩의 가치는 단일 요청 1개를 극단적으로 빠르게 끝내는 것보다, 여러 요청을 동시에 받아도 시스템이 버티게 하는 데 더 가깝습니다.
 
-- worker가 늘어날수록 실제 처리량이 증가하는가
-- 동시에 많은 요청이 들어와도 row 수, id, index 정합성이 깨지지 않는가
+### 후속 실험
 
-### 3. 반례
+- 별도 실험에서는 lock 범위를 더 좁히는 방식도 검토했습니다.
+- 그 경우 서로 덜 충돌하는 요청이 동시에 통과할 수 있어서, worker 수가 많은 구성이 더 유리한 결과도 확인했습니다.
+- 다만 현재 repo의 기본 구현은 여전히 전역 `rwlock` 기반 MVP입니다.
 
-그런데 첫 결과는 예상과 달랐습니다. worker를 늘려도 항상 더 빨라지지 않았고, 어떤 케이스에서는 오히려 worker가 적은 쪽이 더 빨랐습니다. 즉, `멀티스레딩 = 무조건 속도 향상`이라는 가설이 바로 깨졌습니다.
-<img width="629" height="383" alt="Screenshot 2026-04-22 at 23 35 19" src="https://github.com/user-attachments/assets/179cf5bd-6dc1-432e-81f9-37f02d2bab73" />
+## 6. Benchmark
 
-### 4. 왜 이런 결과가 나왔는가
+벤치마크 스크립트:
 
-원인은 멀티스레딩 자체가 아니라 `병렬로 실행될 수 있는 구간이 실제로 얼마나 남아 있느냐`였습니다.
+```bash
+sh tests/bench_api_server.sh
+```
 
-- 기본 구현은 correctness와 구현 단순성을 위해 전역 `pthread_rwlock_t`를 사용했습니다.
-- `INSERT`는 write lock이라 한 번에 하나씩만 실행됩니다.
-- `SELECT`도 preload 단계에서는 write lock을 거친 뒤 read lock으로 실행됩니다.
-- 우리 workload의 핵심 쿼리는 `WHERE id = ?` 형태라 실제 작업이 매우 짧고, B+Tree point lookup도 빨리 끝납니다.
-- 그래서 어떤 구간에서는 SQL 실행 시간보다 queue mutex, lock 경합, context switch 같은 오버헤드가 더 크게 보였습니다.
+스크립트 기본값:
 
-즉, worker thread는 여러 개였지만 DB 안쪽의 중요한 구간은 충분히 병렬화되지 못했고, 그래서 기대만큼의 속도 향상이 바로 나타나지 않았습니다.
+- 요청 수: 케이스당 `1000`
+- 반복 횟수: `3`
+- 동시 요청 수: `32`
+- worker 후보: `2 4 8`
+- queue 후보: `32 64 128`
+- workload: `select-only`, `insert-only`, `mixed`
 
-### 5. 여기서 배운 점
+결과 파일:
 
-이 실험으로 저희가 얻은 핵심 교훈은 아래와 같습니다.
+- `build/bench_api_server_results.tsv`
+- `build/bench_api_server_runs.tsv`
 
-- 멀티스레딩은 `무조건 더 빠른 기술`이 아니다.
-- 속도는 thread 개수보다 `lock granularity`, 공유 상태, 작업 길이에 더 크게 영향을 받는다.
-- 서버에서 멀티스레딩의 가치는 `단일 요청 1개를 극단적으로 빠르게 끝내는 것`보다 `여러 요청을 동시에 받아도 시스템이 버티게 하는 것`에 더 가깝다.
-- benchmark는 단순 속도 비교보다 `throughput`, `tail latency`, `rejected request`, `정합성`을 함께 봐야 의미가 있다.
+자주 쓰는 환경 변수:
 
-### 6. 후속 실험: 락 범위를 줄여보면?
+- `REQUESTS_PER_RUN`
+- `RUNS_PER_CASE`
+- `CONCURRENCY`
+- `WORKERS_LIST`
+- `QUEUE_SIZES`
+- `WORKLOADS`
+- `SEED_ROWS`
 
-이후에는 `전역 lock이 병목이라면, lock 범위를 더 좁히면 멀티스레딩 이점이 살아나는가?`라는 새 가설을 세웠습니다.
+예시:
 
-그래서 후속 실험에서는 전역 단위로 잠그는 대신, 충돌 가능성이 있는 id 주변 범위만 잠그는 방식으로 lock 범위를 줄여봤습니다. 그러자 서로 멀리 떨어진 데이터를 다루는 요청은 동시에 통과할 수 있게 되었고, worker 수가 많은 멀티스레드 구성이 실제로 더 좋은 성능을 보이기 시작했습니다.
+```bash
+REQUESTS_PER_RUN=200 RUNS_PER_CASE=2 CONCURRENCY=16 \
+WORKERS_LIST="1 2 4 8" QUEUE_SIZES="32 64" WORKLOADS="mixed" \
+SEED_ROWS=5000 sh tests/bench_api_server.sh
+```
 
-여기서 중요한 해석은 `멀티스레딩이 틀린 접근이었다`가 아니라, `coarse-grained lock이 병렬성을 가리고 있었고, lock 범위를 줄이자 멀티스레딩의 장점이 드러났다`는 점입니다.
+## 제한 사항
 
-
-저희가 했던 과제에서 적은 양의 데이터로 실험을 하기에 한 스레드당 한 개의 LOCK을 사용했습니다. 그러자 worker 의 갯수는 4,8개일 때가 가장 느리게 나왔습니다. 오버 헤드 불필요한 큐 때문에 오버헤드가 커져 그런 현상이 나타나였고
-1,2개의 worker 스레드를 사용 할 때는 오버헤드를 가지지 않기에 2가 대부분 1보다 빠르게 나왔습니다. 하지만 가끔 1개의 워커가 더 빠르게 나타나는 경우는 2개의 경우의 worst 핏이나 환경에 따라서 운이 좋게 나타날 수 있는 현상이였음을 
-확인했습니다.
-
-
-<img width="1409" height="684" alt="스크린샷 2026-04-22 오후 11 58 18" src="https://github.com/user-attachments/assets/ffbf15ad-1568-412c-8f0d-46f13a61b29c" />
-
-
-### 7. 발표에서 강조할 문장
-
-이 프로젝트의 핵심 메시지는 아래 한 문장으로 정리할 수 있습니다.
-
-> 저희는 처음에 멀티스레딩이면 무조건 더 빠를 것이라고 생각했지만, 실험을 통해 실제 성능은 스레드 수보다 lock 범위와 충돌 단위에 더 크게 좌우된다는 것을 확인했습니다.
-
-그리고 최종적으로는 이렇게 연결하면 됩니다.
-
-- 기본 구현은 correctness 우선의 전역 `rwlock` 기반 MVP였다.
-- benchmark로 예상이 틀렸다는 반례를 확인했다.
-- 원인을 `lock granularity` 관점에서 해석했다.
-- lock 범위를 줄인 후속 실험으로 성능 개선 방향까지 확인했다.
+- 구현 범위는 MVP에 맞춰 좁게 유지했습니다.
+- write는 coarse-grained lock으로 보호합니다.
+- read path도 preload 단계에서는 write lock을 사용합니다.
+- workload가 매우 짧으면 thread/queue/lock 오버헤드가 더 크게 보일 수 있습니다.
 
 ## 참고
 
-- [Configure and run performance tests in Postman](https://learning.postman.com/docs/collections/performance-testing/performance-test-configuration/)
-- [View metrics for performance tests in Postman](https://learning.postman.com/docs/collections/performance-testing/performance-test-metrics/)
+- [Postman Performance Testing Docs](https://learning.postman.com/docs/collections/performance-testing/performance-test-configuration/)
+- [Postman Performance Metrics Docs](https://learning.postman.com/docs/collections/performance-testing/performance-test-metrics/)
