@@ -115,7 +115,7 @@ tests/bench_api_server.sh
 build/api_benchmark.csv          # 3회 반복 평균 요약 CSV
 build/api_benchmark_runs.csv     # 각 run별 raw CSV
 build/api_benchmark_summary.txt  # 한눈 요약 텍스트
-build/api_benchmark_report.html  # 한눈 HTML 리포트
+build/api_benchmark_report.html  # avg_ms_mean 낮은 순으로 정렬된 HTML 리포트
 ```
 
 환경변수로 빠르게 조정할 수 있습니다.
