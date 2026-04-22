@@ -30,11 +30,13 @@ Queue가 있으면 요청 접수 속도와 DB 처리 속도를 분리할 수 있
 1024는 과제용 서버에서 충분히 크고 관리하기 쉽다.
 큐가 가득 차면 요청을 오래 붙잡지 말고 503으로 거절한다.
 
-## 5. 왜 rwlock인가?
+## 5. 왜 write lock인가?
 
 모든 요청에 mutex 전역락을 걸면 DB가 사실상 싱글 스레드가 됩니다.
 
-rwlock을 쓰면 읽기는 함께 들어가고, 쓰기는 단독으로 들어갑니다. 그래서 SELECT 중심 workload에서 병렬성을 얻고 INSERT/DELETE/CREATE는 안전하게 보호합니다.
+이번 구현에서는 SELECT가 DB 구조를 바꾸지 않는다는 과제 정책에 맞춰 SELECT에는 read lock을 걸지 않습니다.
+
+대신 INSERT/DELETE/CREATE 같은 write 요청만 `pthread_rwlock_wrlock()`으로 단독 실행합니다.
 
 ## 6. 왜 WRITE는 배타 lock인가?
 
@@ -42,14 +44,14 @@ INSERT/DELETE/CREATE는 B+Tree와 row 저장소를 바꿉니다.
 
 두 write가 동시에 들어오면 배열 크기 변경, row 추가, index split, delete 후 index rebuild가 섞일 수 있습니다. 그래서 write lock으로 단독 실행합니다.
 
-## 7. 왜 READ는 공유 lock인가?
+## 7. 왜 READ는 lock 없이 실행하는가?
 
 SELECT는 DB 구조를 바꾸지 않으므로 여러 thread가 동시에 실행해도 된다.
 INSERT/DELETE는 B+ Tree와 row 저장소를 바꾸므로 단독 실행해야 한다.
 모든 요청에 mutex 전역락을 걸면 DB가 사실상 싱글 스레드가 된다.
-rwlock을 쓰면 읽기는 병렬, 쓰기는 안전하게 처리할 수 있다.
+SELECT에 lock을 걸지 않으면 읽기 요청끼리는 worker thread에서 바로 병렬 실행된다.
 
-구현에서는 SELECT에 `pthread_rwlock_rdlock()`을 사용했습니다. 이는 write를 막으면서 read끼리는 동시에 실행하게 하는 공유 lock입니다.
+구현에서는 SELECT가 `exec_select()`로 바로 들어가고, CREATE/INSERT/DELETE만 write lock을 잡는다.
 
 ## 8. 왜 worker 수를 1,2,4,8,16,32로 비교하는가?
 

@@ -91,7 +91,7 @@
 
 질문:
 
-- SELECT는 read lock인가?
+- SELECT는 lock 없이 바로 읽는가?
 - CREATE/INSERT/DELETE는 write lock인가?
 - write 중 B+Tree와 row 저장소가 동시에 바뀌어도 안전한가?
 

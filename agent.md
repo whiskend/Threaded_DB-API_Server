@@ -39,7 +39,7 @@
 - 서버용 `db_exec()`는 과제 SQL 부분집합을 처리하고, 인덱스는 기존 B+Tree 구현을 직접 재사용한다.
 - 기존 CLI `sql_processor`는 유지하고, 새 서버 바이너리 `server`를 별도 타깃으로 만든다.
 - DELETE는 기존 B+Tree에 delete 함수가 없어서 row를 tombstone 처리한 뒤 살아있는 row만으로 인덱스를 재빌드한다.
-- SELECT는 `pthread_rwlock_rdlock`, CREATE/INSERT/DELETE는 `pthread_rwlock_wrlock`을 사용한다.
+- SELECT는 lock 없이 바로 읽고, CREATE/INSERT/DELETE는 `pthread_rwlock_wrlock`을 사용한다.
 - Ubuntu CI에서 POSIX 타입이 숨지 않도록 `_XOPEN_SOURCE=700`, `_DEFAULT_SOURCE`를 CFLAGS에 둔다.
 
 문제:
@@ -56,6 +56,7 @@
 - macOS에서 `_SC_NPROCESSORS_ONLN`이 feature macro 조합에 따라 숨을 수 있어, 상수가 없으면 기본 worker를 2로 둔다.
 - Issue/PR 본문은 docs/issue.md, docs/pr.md에 저장했다.
 - PR 생성 URL은 push 결과로 확인했다: https://github.com/whiskend/Threaded_DB-API_Server/pull/new/seonho
+- 사용자 피드백에 따라 SELECT read lock을 제거했다.
 
 테스트 결과:
 - 기존 make: 성공

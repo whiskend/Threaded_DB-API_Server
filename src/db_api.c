@@ -535,9 +535,8 @@ int db_exec(const char *sql, char *out, int max)
     }
 
     if (db_is_read_sql(sql)) {
-        pthread_rwlock_rdlock(&g_db.lock);
+        // SELECT는 DB 구조를 바꾸지 않으므로 lock 없이 바로 읽는다.
         exec_select(sql, out, max);
-        pthread_rwlock_unlock(&g_db.lock);
     } else {
         pthread_rwlock_wrlock(&g_db.lock);
         if (strncasecmp(p, "CREATE", 6U) == 0 && word_end(p[6])) {
